@@ -1,5 +1,5 @@
 {-# OPTIONS -fwarn-tabs -Wall #-}
-{-# LANGUAGE MultiParamTypeClasses, TemplateHaskell #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 
 module Data.KCenterClustering
   ( kCenters
@@ -24,9 +24,6 @@ import Pipes
 import qualified Pipes.Prelude as P
 
 import Test.QuickCheck
-
-tests :: IO Bool
-tests = $quickCheckAll
 
 errorEmptyList     :: String -> a
 errorEmptyList fun = error $ "Data.KCenterClustering." ++ fun ++ ": empty list"
@@ -78,24 +75,24 @@ kCenters' k0 ps c1
                (_, c) = F.maximumBy (comparing fst) $ dFromCenters xs
            in  c : go (k - 1) xs (c : cs)
 
-prop_farthestPointNumberOfCenters :: Int
+_prop_farthestPointNumberOfCenters :: Int
                                   -> NonEmptyList Point2D
                                   -> Property
-prop_farthestPointNumberOfCenters k (NonEmpty ps) =
+_prop_farthestPointNumberOfCenters k (NonEmpty ps) =
   let n = length ps
   in
     k <= n ==> do
       c1 <- elements ps
       let centers = kCenters' k ps c1
       return $ case () of _
-                            | k <= 0    -> length centers == 0
+                            | k <= 0    -> null centers
                             | k <= n    -> length centers == k
                             | otherwise -> length centers == n
 
-prop_farthestPointRadiusInvariant :: Positive Int
+_prop_farthestPointRadiusInvariant :: Positive Int
                                   -> NonEmptyList Point2D
                                   -> Property
-prop_farthestPointRadiusInvariant (Positive k) (NonEmpty ps) =
+_prop_farthestPointRadiusInvariant (Positive k) (NonEmpty ps) =
   let n = length ps
   in
     k < n ==> do
@@ -123,12 +120,12 @@ kCentersStreaming k ps d = do first <- P.head ps
 -- input collection of points is assumed to contain no duplicates.
 kCentersStreaming'            :: (Monad m, Ord d, MetricSpace p d) =>
                                  Int
-                              -> Producer p m ()
+                              -> Producer p m r
                               -> p
                               -> d
-                              -> m (Either ([p], Producer p m ()) [p])
+                              -> m (Either ([p], Producer p m r) [p])
 kCentersStreaming' k0 ps c1 d
-  | k0 > 0     = go 1 ps [c1]
+  | k0 > 0    = go 1 ps [c1]
   | otherwise = return $ Right []
   where go k xs cs = do
           hd <- next xs
@@ -136,29 +133,29 @@ kCentersStreaming' k0 ps c1 d
             Left _         -> return $ Right cs
             Right (p, xs') ->
               if nearestDistance p cs > d
-              then if k == k0
-                   then return $ Left (cs, xs')
-                   else do result <- go (k + 1) xs' (p : cs)
-                           return $ do rest <- result
-                                       return $ p : rest
-              else go k xs' cs
+                then if k == k0
+                       then return $ Left (cs, xs')
+                       else do result <- go (k + 1) xs' (p : cs)
+                               return $ do rest <- result
+                                           return rest
+                else go k xs' cs
 
-pointInRadius   :: Double -> Gen Point2D
-pointInRadius r = pointInSquare r `suchThat` inCircle
-  where inCircle (x, y) = x * x + y * y <= r * r
-        pointInSquare s = (,) <$> range s <*> range s
-        range x = choose (negate x, x)
-
-prop_allPointsWithinRadiusYieldsOneCenter   :: Double -> Gen Bool
-prop_allPointsWithinRadiusYieldsOneCenter d = do
-  ps <- shuffle =<< (listOf1 $ pointInRadius d)
+_prop_allPointsWithinRadiusYieldsOneCenter   :: Double -> Gen Bool
+_prop_allPointsWithinRadiusYieldsOneCenter d = do
+  ps <- shuffle =<< listOf1 (pointInRadius d)
   c1 <- elements ps
   let stream  = each ps
       centers = kCentersStreaming' 1 stream c1 d
   return $ length centers == 1
 
-shuffle :: (Eq a) => [a] -> Gen [a]
-shuffle [] = return []
-shuffle xs = do x  <- oneof $ map return xs
-                ys <- shuffle $ delete x xs
-                return (x:ys)
+    where shuffle    :: (Eq a) => [a] -> Gen [a]
+          shuffle [] = return []
+          shuffle xs = do x  <- oneof $ map return xs
+                          ys <- shuffle $ delete x xs
+                          return $ x : ys
+
+          pointInRadius   :: Double -> Gen Point2D
+          pointInRadius r = pointInSquare r
+                            `suchThat` \(x, y) -> x * x + y * y <= r * r
+          pointInSquare s = (,) <$> range s <*> range s
+          range x         = choose (negate x, x)
