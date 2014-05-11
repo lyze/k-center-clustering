@@ -6,7 +6,7 @@ GHC_OPTS = -O2 -threaded -rtsopts
 all: Main Benchmark GenSamples
 
 clean:
-	rm -rvf *.hi *.o *.exe Main Benchmark GenSamples
+	rm -rvf */*.hi */*.o */*.exe Main Benchmark GenSamples
 
 Main main: Main.hs
 	$(GHC) Main.hs
