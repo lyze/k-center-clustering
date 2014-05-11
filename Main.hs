@@ -12,7 +12,6 @@ import Data.ClosestPair
 import Data.Heap (MinPrioHeap)
 import qualified Data.Heap as Heap
 import Data.KCenterClustering
-import Data.List
 import Data.MetricSpace
 import Data.PSQueue (PSQ, Binding(..))
 import qualified Data.PSQueue as PQ
@@ -111,18 +110,19 @@ main = do
       case parseResult of
         Left err -> ioError . userError $ show err
         Right ps -> do
-          (centers, threads) <- parKCenters (optK opts) (each ps) (optA opts) (optM opts)
+          (centers, threads, seal) <- parKCenters (optK opts) (each ps) (optA opts) (optM opts)
           waitForThreads threads
-          writeFile (optOutput opts) . concat . intersperse " " . map show $ centers
+          atomically seal
+          writeFile (optOutput opts) . unwords . map show $ centers
 
-waitForThreads    :: [Async ()] -> IO ()
-waitForThreads ts = mapM_ wait ts
+waitForThreads :: [Async ()] -> IO ()
+waitForThreads = mapM_ wait
 
 type Instance       = Int         -- what number instance is this worker thread?
 type WorkerResult p = (Instance, [p])
 type ThreadPool     = PSQ (Async ()) Instance
 
-data ComputationException = HigherThreadTerminatedException
+data ComputationException = HigherThreadTerminatedException Int
                             deriving (Show, Typeable)
 
 instance Exception ComputationException
@@ -130,59 +130,78 @@ instance Exception ComputationException
 async' :: (Async () -> IO b) -> IO b
 async' = withAsync (return ())
 
-parKCenters :: forall p d.
-               (MetricSpace p d, Num d) =>
-               Int              -- ^ /k/
-            -> Producer p IO () -- ^ the stream of points, assumed all distinct
-            -> d                -- ^ the factor by which to scale the radius
-            -> Int              -- ^ the number of parallel instances to run
-            -> IO ([p], [Async ()])            -- ^ the list of /k/-centers
+parKCenters :: (MetricSpace p d, Num d) =>
+               Int                          -- ^ /k/
+            -> Producer p IO ()             -- ^ the stream of points, assumed all distinct
+            -> d                            -- ^ the factor by which to scale the radius
+            -> Int                          -- ^ the number of parallel instances to run
+            -> IO ([p], [Async ()], STM ()) -- ^ the list of /k/-centers
 parKCenters k ps a m = do
   (resultsOut, resultsIn, sealResults) <- spawn' Unbounded
-  let centersAndThreads = parKCenters' k ps a m resultsOut resultsIn
-  atomically sealResults
-  centersAndThreads
+  (centers, threads) <- parKCenters' k ps a m resultsOut resultsIn
+  return (centers, threads, sealResults)
 
 parKCenters' :: forall p d. (Num d, MetricSpace p d) =>
-               Int                  -- ^ /k/
-            -> Producer p IO ()     -- ^ the stream of points, assumed all distinct
-            -> d                    -- ^ the factor by which to scale the radius
-            -> Int                  -- ^ the number of parallel instances to run
+               Int                     -- ^ /k/
+            -> Producer p IO ()        -- ^ the stream of points, assumed all distinct
+            -> d                       -- ^ the factor by which to scale the radius
+            -> Int                     -- ^ the number of parallel instances to run
             -> Output (WorkerResult p) -- ^ the outbox for job results
             -> Input (WorkerResult p)  -- ^ the inbox for job results
-            -> IO ([p], [Async ()]) -- ^ the list of /k/-centers and the running threads to wait on
+            -> IO ([p], [Async ()])    -- ^ the list of /k/-centers and the running threads to wait on
 parKCenters' k ps a m resultsOut resultsIn = do
   initial <- P.toListM $ ps >-> P.take (k + 1)
+  pool    <- atomically $ newTVar PQ.empty
+
   let d0 = uncurry distance $ closestPair initial
-  pool <- atomically $ newTVar PQ.empty
   mapM_ (worker pool resultsOut d0) [0 .. m - 1]
-  centers <- runEffect $ ([] <$ fromInput resultsIn) >-> handler pool
+
+  centers <- runEffect $ ([] <$ fromInput resultsIn) >-> resultsHandler pool
   threads <- readTVarIO pool
+
   return (centers, PQ.keys threads)
 
     where worker                 :: TVar ThreadPool -> Output (WorkerResult p) -> d -> Int -> IO ()
           worker pool msgBox d n =
-            let work     :: Instance -> Async () -> IO ()
-                work i h = do
+            let work     :: Async () -> Instance -> IO ()
+                work h i = do
                   job <- kCentersStreaming k ps $ d * a^i
                   case job of
                     Left _   ->
                       do ts <- atomically $ getThreadsLE n pool
-                         mapM_ (`cancelWith` HigherThreadTerminatedException) ts
+                         mapM_ (`cancelWith` HigherThreadTerminatedException i) ts
                          let i' = i + fromIntegral m
-                         atomically . modifyTVar pool $ PQ.adjust (const i') h
-                         work i' h
+                         adjust h i'
+                         work h i'
                     Right cs ->
                       runEffect $ P.yield (n, cs) >-> toOutput msgBox
+
+                adjust       :: Async () -> Instance -> IO ()
+                adjust h pri = atomically . modifyTVar pool $ PQ.adjust (const pri) h
+
                 deregister   :: Async () -> IO ()
                 deregister h = atomically . modifyTVar pool $ PQ.delete h
-            in  do
-              async' $ \h -> do
-                atomically $ modifyTVar pool $ PQ.insert h n
-                work n h `finally` deregister h
 
-          handler      :: TVar ThreadPool -> Consumer (WorkerResult p) IO [p]
-          handler pool = go (Heap.empty :: MinPrioHeap Instance [p])
+                register     :: Async () -> Instance -> IO ()
+                register h i = atomically . modifyTVar pool $ PQ.insert h i
+
+                exceptionHandler :: Async ()
+                                 -> Instance
+                                 -> ComputationException
+                                 -> IO ()
+                exceptionHandler h lo (HigherThreadTerminatedException hi) =
+                  let dbl = fromIntegral (hi - lo) / fromIntegral m
+                      int = ceiling (dbl :: Double)
+                      new = m * int
+                  in  work h new
+            in
+              async' $ \h -> do
+                register h n
+                work h n `catch` exceptionHandler h n `finally` deregister h
+
+          resultsHandler      :: TVar ThreadPool
+                              -> Consumer (WorkerResult p) IO [p]
+          resultsHandler pool = go (Heap.empty :: MinPrioHeap Instance [p])
             where go oldResults = do
                     result <- await -- received a result
                     let newResults = Heap.insert result oldResults
