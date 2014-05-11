@@ -82,8 +82,8 @@ closestPair2D ps
                            | distance s s1 == distance s s2 = EQ
                            | otherwise              = GT
 
-prop_2DAlgMatchesBruteForce :: [Point2D] -> Property
-prop_2DAlgMatchesBruteForce = check closestPair2D
+_prop_2DAlgMatchesBruteForce :: [Point2D] -> Property
+_prop_2DAlgMatchesBruteForce = check closestPair2D
   where check alg ps =
           length ps > 1 ==> distance' (alg ps) == distance' (closestPair ps)
         distance' = uncurry distance
