@@ -1,29 +1,32 @@
 {-# OPTIONS -fwarn-tabs -Wall #-}
-{-# LANGUAGE TupleSections, ScopedTypeVariables #-}
+{-# LANGUAGE DeriveDataTypeable, TupleSections, ScopedTypeVariables #-}
 
 module Main (main) where
 
-import Control.Applicative
+import Control.Applicative hiding ((<|>))
 import Control.Concurrent.Async
 import Control.Concurrent.STM
+import Control.Exception
 import Control.Monad
 import Data.ClosestPair
 import Data.Heap (MinPrioHeap)
 import qualified Data.Heap as Heap
 import Data.KCenterClustering
-import Data.Map (Map)
-import qualified Data.Map as Map
+import Data.List
 import Data.MetricSpace
+import Data.PSQueue (PSQ, Binding(..))
+import qualified Data.PSQueue as PQ
+import Data.Typeable.Internal
 import Numeric
 import Pipes
+import qualified Pipes as P (yield)
 import qualified Pipes.Prelude as P
 import Pipes.Concurrent
 import System.Console.GetOpt
 import System.Environment
-import Text.Parsec.Char
-import Text.Parsec.Combinator
-import Text.Parsec.Prim
+import Text.Parsec
 import Text.Parsec.String
+import Text.Read (readMaybe)
 
 data Options = Options { optShowHelp :: Bool
                        , optK        :: Int
@@ -42,22 +45,27 @@ defaultOptions = Options { optShowHelp = False
                          , optInput    = ""
                          }
 
+read'   :: Read a => String -> IO a
+read' s = case readMaybe s of
+            Nothing -> ioError . userError $ "Could not parse option argument `" ++ s ++ "'"
+            Just a  -> return a
+
 options :: [OptDescr (Options -> IO Options)]
 options =
   [ Option ['h'] ["help"]
     (NoArg (\opts -> return opts { optShowHelp = True }))
     "help"
 
-  , Option ['a'] ["alpha", "factor", "scale"]
-    (ReqArg (\a opts -> return opts { optK = read a }) "a")
-    "scaling factor (greater than 1)"
-
   , Option ['k'] ["centers"]
-    (ReqArg (\k opts -> return opts { optK = read k }) "k")
+    (ReqArg (\s opts -> do k <- read' s; return opts { optK = k }) "k")
     "number of centers"
 
+  , Option ['a'] ["alpha", "factor", "scale"]
+    (ReqArg (\s opts -> do a <- read' s; return opts { optA = a }) "a")
+    "scaling factor (greater than 1)"
+
   , Option ['m'] ["instances"]
-    (ReqArg (\m opts -> return opts { optM = read m }) "m")
+    (ReqArg (\s opts -> do m <- read' s; return opts { optM = m }) "m")
     "number of instances"
 
   , Option ['o'] ["output"]
@@ -76,23 +84,19 @@ parseOptions argv =
     (o, [n], []) -> foldM (flip id) defaultOptions { optInput = n } o
     (_, _, errs) -> ioError . userError $ concat errs ++ usageInfo header options
 
-point2DP :: Parser [Point2D]
-point2DP = endBy1 (tuple float float) spaces
-  where float = do
+point2DList :: Parser [Point2D]
+point2DList = sepEndBy1 (tuple float float) spaces
+  where float :: Parser Double
+        float = do
           s <- getInput
           case readSigned readFloat s of
             [(n, s')] -> n <$ setInput s'
             _         -> empty
         tuple     :: Parser a -> Parser b -> Parser (a, b)
-        tuple x y = parens $ do
-                      spaces
-                      a <- x
-                      spaces
-                      _ <- char ','
-                      spaces
-                      b <- y
-                      spaces
-                      return (a, b)
+        tuple x y = parens $ (,) <$>
+                    (spaces *> x <*
+                     spaces <* char ',' <* spaces)
+                    <*> y <* spaces
         parens :: Parser a -> Parser a
         parens = between (char '(') (char ')')
 
@@ -103,14 +107,28 @@ main = do
   if optShowHelp opts
     then putStrLn $ usageInfo header options
     else do
-      parseResult <- parseFromFile point2DP $ optInput opts
+      parseResult <- parseFromFile point2DList $ optInput opts
       case parseResult of
         Left err -> ioError . userError $ show err
         Right ps -> do
-          centers <- parKCenters (optK opts) (each ps) (optA opts) (optM opts)
-          writeFile (optOutput opts) $ show centers
+          (centers, threads) <- parKCenters (optK opts) (each ps) (optA opts) (optM opts)
+          waitForThreads threads
+          writeFile (optOutput opts) . concat . intersperse " " . map show $ centers
 
-type JobResult a = (Int, Either ([a], Producer a IO ()) [a])
+waitForThreads    :: [Async ()] -> IO ()
+waitForThreads ts = mapM_ wait ts
+
+type Instance       = Int         -- what number instance is this worker thread?
+type WorkerResult p = (Instance, [p])
+type ThreadPool     = PSQ (Async ()) Instance
+
+data ComputationException = HigherThreadTerminatedException
+                            deriving (Show, Typeable)
+
+instance Exception ComputationException
+
+async' :: (Async () -> IO b) -> IO b
+async' = withAsync (return ())
 
 parKCenters :: forall p d.
                (MetricSpace p d, Num d) =>
@@ -118,74 +136,68 @@ parKCenters :: forall p d.
             -> Producer p IO () -- ^ the stream of points, assumed all distinct
             -> d                -- ^ the factor by which to scale the radius
             -> Int              -- ^ the number of parallel instances to run
-            -> IO [p]           -- ^ the list of /k/-centers
+            -> IO ([p], [Async ()])            -- ^ the list of /k/-centers
 parKCenters k ps a m = do
   (resultsOut, resultsIn, sealResults) <- spawn' Unbounded
-  let centers = parKCenters' k ps a m resultsOut resultsIn
+  let centersAndThreads = parKCenters' k ps a m resultsOut resultsIn
   atomically sealResults
-  centers
+  centersAndThreads
 
 parKCenters' :: forall p d. (Num d, MetricSpace p d) =>
                Int                  -- ^ /k/
             -> Producer p IO ()     -- ^ the stream of points, assumed all distinct
             -> d                    -- ^ the factor by which to scale the radius
             -> Int                  -- ^ the number of parallel instances to run
-            -> Output (JobResult p) -- ^ the outbox for job results
-            -> Input (JobResult p)  -- ^ the inbox for job results
-            -> IO [p]               -- ^ the list of /k/-centers
+            -> Output (WorkerResult p) -- ^ the outbox for job results
+            -> Input (WorkerResult p)  -- ^ the inbox for job results
+            -> IO ([p], [Async ()]) -- ^ the list of /k/-centers and the running threads to wait on
 parKCenters' k ps a m resultsOut resultsIn = do
   initial <- P.toListM $ ps >-> P.take (k + 1)
   let d0 = uncurry distance $ closestPair initial
+  pool <- atomically $ newTVar PQ.empty
+  mapM_ (worker pool resultsOut d0) [0 .. m - 1]
+  centers <- runEffect $ ([] <$ fromInput resultsIn) >-> handler pool
+  threads <- readTVarIO pool
+  return (centers, PQ.keys threads)
 
-  ts      <- mapM (worker resultsOut d0) [0 .. m - 1]
-  threads <- atomically . newTVar . Map.fromList . zip [0 .. m - 1] $ ts
+    where worker                 :: TVar ThreadPool -> Output (WorkerResult p) -> d -> Int -> IO ()
+          worker pool msgBox d n =
+            let work     :: Instance -> Async () -> IO ()
+                work i h = do
+                  job <- kCentersStreaming k ps $ d * a^i
+                  case job of
+                    Left _   ->
+                      do ts <- atomically $ getThreadsLE n pool
+                         mapM_ (`cancelWith` HigherThreadTerminatedException) ts
+                         let i' = i + fromIntegral m
+                         atomically . modifyTVar pool $ PQ.adjust (const i') h
+                         work i' h
+                    Right cs ->
+                      runEffect $ P.yield (n, cs) >-> toOutput msgBox
+                deregister   :: Async () -> IO ()
+                deregister h = atomically . modifyTVar pool $ PQ.delete h
+            in  do
+              async' $ \h -> do
+                atomically $ modifyTVar pool $ PQ.insert h n
+                work n h `finally` deregister h
 
-  runEffect $ ([] <$ fromInput resultsIn) >-> handler d0 resultsOut threads
+          handler      :: TVar ThreadPool -> Consumer (WorkerResult p) IO [p]
+          handler pool = go (Heap.empty :: MinPrioHeap Instance [p])
+            where go oldResults = do
+                    result <- await -- received a result
+                    let newResults = Heap.insert result oldResults
+                    ts <- lift $ readTVarIO pool
+                    case PQ.findMin ts of         -- are there jobs left?
+                      Nothing         ->
+                        let Just (_, cs) = Heap.viewHead newResults
+                        in  return cs
+                      Just (_ :-> lo) ->
+                        let Just (i, cs) = Heap.viewHead newResults
+                        in if i < lo
+                             then return cs
+                             else go newResults
 
-    where worker            :: Output (JobResult p) -> d -> Int -> IO (Async ())
-          worker msgBox d n = async $ do
-                                  job <- kCentersStreaming k ps $ d * a^n
-                                  runEffect $ yield (n, job) >-> toOutput msgBox
-
-          handler                  :: d -> Output (JobResult p) -> TVar (Map Int (Async ())) -> Consumer (JobResult p) IO [p]
-          handler d msgBox threads = go (Heap.empty :: MinPrioHeap Int [p])
-            where go successes = do
-                    result <- await
-
-                    case result of
-
-                      (i, Left (cs, ps')) ->
-                        do ts <- lift . atomically . removeThreadsLE i $ threads
-                           lift . Map.foldr (\t _ -> cancel t) (return ()) $ ts
-                           let i' = i + fromIntegral m
-                           handle <- lift . async $ do
-                                       job <- kCentersStreaming k (each cs >> ps') $ d * a^i'
-                                       runEffect $ yield (i', job) >-> toOutput msgBox
-                           lift . atomically $ modifyTVar threads (Map.insert i' handle . Map.delete i)
-                           go successes
-
-                      (i, Right cs)  ->
-                        do handle <- lift . atomically $
-                                     do ts <- readTVar threads
-                                        if Map.null ts
-                                          then return Nothing
-                                          else let (low, _) = Map.findMin ts
-                                               in return $ Just low
-                           case handle of                    -- running threads?
-                             Nothing ->
-                               case Heap.viewHead successes of
-                                 Nothing -> error "parKCenters: logic error"
-                                 Just (_, cs') -> return cs'
-                             Just h  ->
-                               if i == h                -- is the lowest thread?
-                                 then return cs
-                                 else do lift . atomically . modifyTVar threads $ Map.delete i
-                                         go (Heap.insert (i, cs) successes)
-
-          removeThreadsLE           :: Int -> TVar (Map Int (Async ())) -> STM (Map Int (Async ()))
-          removeThreadsLE n threads = do
-                         ts <- readTVar threads
-                         let (below, above) = Map.partitionWithKey f ts
-                             f i _ = i <= n
-                         writeTVar threads above
-                         return below
+          getThreadsLE           :: Int -> TVar ThreadPool -> STM [Async ()]
+          getThreadsLE n pool = do
+            ts <- readTVar pool
+            return . map (\(h :-> _) -> h) $ PQ.atMost n ts
