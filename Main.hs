@@ -25,6 +25,7 @@ import System.Console.GetOpt
 import System.Environment
 import Text.Parsec
 import Text.Parsec.String
+import Text.Printf
 import Text.Read (readMaybe)
 
 data Options = Options { optShowHelp :: Bool
@@ -92,12 +93,7 @@ point2DList = sepEndBy1 (tuple float float) spaces
             [(n, s')] -> n <$ setInput s'
             _         -> empty
         tuple     :: Parser a -> Parser b -> Parser (a, b)
-        tuple x y = parens $ (,) <$>
-                    (spaces *> x <*
-                     spaces <* char ',' <* spaces)
-                    <*> y <* spaces
-        parens :: Parser a -> Parser a
-        parens = between (char '(') (char ')')
+        tuple x y = (,) <$> (spaces *> x <* spaces) <*> y <* spaces
 
 main :: IO ()
 main = do
@@ -113,7 +109,10 @@ main = do
           (centers, threads, seal) <- parKCenters (optK opts) (each ps) (optA opts) (optM opts)
           waitForThreads threads
           atomically seal
-          writeFile (optOutput opts) . unwords . map show $ centers
+          writeFile (optOutput opts) .
+                    concat $
+                    map (uncurry $ printf "%30f%30f\n") centers
+
 
 waitForThreads :: [Async ()] -> IO ()
 waitForThreads = mapM_ wait

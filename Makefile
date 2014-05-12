@@ -1,24 +1,22 @@
 GHC = ghc
-GHC_OPTS = -O2 -threaded -rtsopts
+GHC_OPTS = -O2 -threaded -eventlog -rtsopts
 
-.PHONY: all main Main kclustering KClustering GenSamples gensamples points view
+.PHONY: all main Main GenSamples gensamples points view
 
-all: Main Benchmark GenSamples
+all: Main GenSamples points
 
 clean:
-	rm -rvf */*.hi */*.o */*.exe Main Benchmark GenSamples
+	rm -rvf */*.hi */*.o */*.exe Main GenSamples
 
-Main main: Main.hs
-	$(GHC) Main.hs
+Main main: Main.hs Makefile
+	$(GHC) $(GHC_OPTS) Main.hs
 
-Benchmark benchmark: Benchmark.hs
-	$(GHC) Benchmark.hs
-
-GenSamples gensamples: GenSamples.hs
-	$(GHC) GenSamples.hs
+GenSamples gensamples: GenSamples.hs Makefile
+	$(GHC) $(GHC_OPTS) GenSamples.hs
 
 points: GenSamples
-	./GenSamples 2 100 100 sample_points.txt
+	./GenSamples -n 100000 -o "sample_points.txt"
 
-view: points
-	gnuplot -e 'set terminal png; plot "points"' >points.png; eog points.png
+test: Main points
+	./main -k 10 -a 1.1 -m 5 -o centers.txt sample_points.txt						       \
+	gnuplot -e 'set terminal png; plot "sample_points.txt" with points 1, "centers.txt" with points 2' >points.png

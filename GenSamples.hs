@@ -1,14 +1,12 @@
 {-# OPTIONS -fwarn-tabs -Wall #-}
 {-# LANGUAGE TupleSections #-}
 
-module GenSamples where
-
 import Control.Monad
-import Data.List
 import Data.MetricSpace
 import System.Environment
 import System.Console.GetOpt
 import Test.QuickCheck
+import Text.Printf
 
 data Options = Options { optShowHelp :: Bool
                        , optOutput   :: String
@@ -55,4 +53,6 @@ main = do
     then putStrLn $ usageInfo header options
     else do
       points <- replicateM (optN opts) $ generate (arbitrary :: Gen Point2D)
-      writeFile (optOutput opts) . concat . intersperse " " $ map show points
+      writeFile (optOutput opts) .
+                concat $
+                map (uncurry $ printf "%30f%30f\n") points
